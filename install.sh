@@ -1,13 +1,22 @@
 #!/bin/sh
 #
-# Kolon Chimera Linux Installer
-# UEFI: GPT + EFI
-# BIOS: MBR
+# Kolon Chimera Linux simple installer
+#
+#   UEFI -> GPT + EFI System Partition + GRUB (x86_64-efi)
+#   BIOS -> MBR + GRUB (i386-pc)
+#
+# Run from the Chimera Linux live ISO as root:
+#   sh kolon-chimera-installer.sh
 #
 
 set -eu
 
-VERSION="0.5.0"
+VERSION="0.6.0"
+MNT="/media/root"
+OFFICIAL_REPO="https://repo.chimera-linux.org"
+
+# State used by the cleanup trap
+INSTALL_STARTED=0
 
 # ==================================================
 # Colors
@@ -30,364 +39,472 @@ else
 fi
 
 # ==================================================
-# Functions
+# Helpers
 # ==================================================
 
 die() {
-    echo
-    echo "${RED}ERROR:${RESET} $1"
+    printf '\n%sERROR:%s %s\n' "$RED" "$RESET" "$1" >&2
     exit 1
 }
 
 info() {
-    echo "${CYAN}==>${RESET} $1"
+    printf '%s==>%s %s\n' "$CYAN" "$RESET" "$1"
 }
 
 success() {
-    echo "${GREEN}✓${RESET} $1"
+    printf '%s✓%s %s\n' "$GREEN" "$RESET" "$1"
 }
 
+# Warnings go to stderr so they are never captured by $(...)
 warning() {
-    echo "${YELLOW}WARNING:${RESET} $1"
+    printf '%sWARNING:%s %s\n' "$YELLOW" "$RESET" "$1" >&2
+}
+
+cls() {
+    if [ -t 1 ]; then
+        clear 2>/dev/null || true
+    fi
+}
+
+banner() {
+    _bar="═══════════════════════════════════════════"
+    _text="$1"
+    _w=43
+    _len=${#_text}
+    _left=$(( (_w - _len) / 2 ))
+    _right=$(( _w - _len - _left ))
+    printf '%s%s' "$BOLD" "$CYAN"
+    printf '╔%s╗\n' "$_bar"
+    printf '║%*s%s%*s║\n' "$_left" "" "$_text" "$_right" ""
+    printf '╚%s╝\n' "$_bar"
+    printf '%s' "$RESET"
+}
+
+section() {
+    cls
+    printf '%s%s%s\n\n' "$BOLD" "$1" "$RESET"
 }
 
 pause() {
-    printf "\nPress Enter to continue..."
-    read -r _
+    printf '\nPress Enter to continue...'
+    IFS= read -r _ || true
 }
 
+# Read one line from stdin into REPLY_LINE (dies on EOF)
+read_line() {
+    IFS= read -r REPLY_LINE || die "Input closed."
+}
+
+# ask "prompt: "  -> prints the answer
 ask() {
-    printf "%s" "$1" >&2
-    read -r ANSWER
-    printf "%s" "$ANSWER"
+    printf '%s' "$1" >&2
+    read_line
+    printf '%s' "$REPLY_LINE"
+}
+
+# ask_default "Prompt" "default" -> prints answer or default
+ask_default() {
+    _ans="$(ask "$1 [$2]: ")"
+    printf '%s' "${_ans:-$2}"
 }
 
 ask_password() {
-    printf "%s" "$1" >&2
-    stty -echo
-    read -r ANSWER
-    stty echo
-    printf "\n" >&2
-    printf "%s" "$ANSWER"
+    printf '%s' "$1" >&2
+    stty -echo 2>/dev/null || true
+    if ! IFS= read -r PW_LINE; then
+        stty echo 2>/dev/null || true
+        die "Input closed."
+    fi
+    stty echo 2>/dev/null || true
+    printf '\n' >&2
+    printf '%s' "$PW_LINE"
+}
+
+# ask_new_password "Label" -> asks twice until both match and are non-empty
+ask_new_password() {
+    while true; do
+        _p1="$(ask_password "$1 password: ")"
+
+        if [ -z "$_p1" ]; then
+            warning "Password cannot be empty."
+            continue
+        fi
+
+        _p2="$(ask_password "Repeat $1 password: ")"
+
+        if [ "$_p1" = "$_p2" ]; then
+            printf '%s' "$_p1"
+            return 0
+        fi
+
+        warning "Passwords do not match. Try again."
+    done
 }
 
 yesno() {
     while true; do
-        printf "%s [y/N]: " "$1" >&2
-        read -r ANSWER
+        printf '%s [y/N]: ' "$1" >&2
+        read_line
 
-        case "$ANSWER" in
-            y|Y|yes|YES)
-                return 0
-                ;;
-            n|N|no|NO|"")
-                return 1
-                ;;
-            *)
-                echo "Please answer yes or no." >&2
-                ;;
+        case "$REPLY_LINE" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            n|N|no|NO|No|"") return 1 ;;
+            *) echo "Please answer yes or no." >&2 ;;
         esac
     done
 }
 
-# ==================================================
-# Root check
-# ==================================================
+# Parse "4G", "512M", "4GiB", "4GB" -> prints size in MiB
+parse_size_mib() {
+    _s="$(printf '%s' "$1" | tr 'a-z' 'A-Z' | tr -d '[:space:]')"
+    _s="${_s%IB}"
+    _s="${_s%B}"
 
-if [ "$(id -u)" -ne 0 ]; then
-    die "Run this installer as root."
+    case "$_s" in
+        *G) _n="${_s%G}"; _mult=1024 ;;
+        *M) _n="${_s%M}"; _mult=1 ;;
+        *)  return 1 ;;
+    esac
+
+    case "$_n" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+
+    _n="$(printf '%s' "$_n" | sed 's/^0*//')"
+    [ -n "$_n" ] || return 1
+
+    printf '%s' $(( _n * _mult ))
+}
+
+valid_hostname() {
+    printf '%s' "$1" |
+        grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+}
+
+valid_username() {
+    [ "$1" != "root" ] &&
+        printf '%s' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'
+}
+
+valid_timezone() {
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_+/-]+$' &&
+        ! printf '%s' "$1" | grep -q '\.\.'
+}
+
+# Partition device path: /dev/sda + 1 -> /dev/sda1, /dev/nvme0n1 + 1 -> /dev/nvme0n1p1
+part_path() {
+    case "$DISK" in
+        *[0-9]) printf '%sp%s' "$DISK" "$1" ;;
+        *)      printf '%s%s' "$DISK" "$1" ;;
+    esac
+}
+
+wait_for_block() {
+    _i=0
+    while [ ! -b "$1" ]; do
+        _i=$((_i + 1))
+        [ "$_i" -le 20 ] || die "Device did not appear: $1"
+        sleep 1
+    done
+}
+
+is_mounted_at_root() {
+    awk -v p="$1" '$1 == p && $2 == "/" { f = 1 } END { exit !f }' /proc/mounts
+}
+
+is_mounted() {
+    awk -v p="$1" '$1 == p { f = 1 } END { exit !f }' /proc/mounts
+}
+
+# Run a shell script (from stdin) inside the new system
+in_chroot() {
+    chimera-chroot "$MNT" /bin/sh -e
+}
+
+# Install packages if they exist in the repositories, warn about the rest
+install_optional_pkgs() {
+    _req="$1"
+
+    in_chroot <<EOF
+avail=""
+for p in $_req; do
+    if apk search -e "\$p" 2>/dev/null | grep -q .; then
+        avail="\$avail \$p"
+    else
+        echo "WARNING: package not found, skipping: \$p"
+    fi
+done
+if [ -n "\$avail" ]; then
+    apk add \$avail
 fi
+EOF
+}
+
+# Enable the first existing dinit service from the list
+enable_service() {
+    _cands="$*"
+
+    in_chroot <<EOF
+mkdir -p /etc/dinit.d/boot.d
+for s in $_cands; do
+    if [ -e "/etc/dinit.d/\$s" ]; then
+        ln -sf "../\$s" "/etc/dinit.d/boot.d/\$s"
+        echo "Service enabled: \$s"
+        exit 0
+    fi
+done
+echo "WARNING: none of these services were found: $_cands"
+EOF
+}
+
+cleanup() {
+    _rc=$?
+    stty echo 2>/dev/null || true
+
+    if [ "$_rc" -ne 0 ] && [ "$INSTALL_STARTED" -eq 1 ]; then
+        printf '\n%sInstallation failed.%s\n' "$RED" "$RESET" >&2
+        echo "Filesystems may still be mounted under $MNT for inspection." >&2
+        echo "Unmount manually with: umount -R $MNT" >&2
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # ==================================================
-# Architecture check
+# Root / architecture checks
 # ==================================================
+
+[ "$(id -u)" -eq 0 ] || die "Run this installer as root."
 
 ARCH="$(uname -m)"
 
-case "$ARCH" in
-    x86_64)
-        ;;
-    *)
-        die "This installer currently supports x86_64 only."
-        ;;
-esac
-
-# ==================================================
-# Dependency check
-# ==================================================
+[ "$ARCH" = "x86_64" ] ||
+    die "This installer currently supports x86_64 only."
 
 for cmd in \
-    lsblk \
-    blkid \
-    mount \
-    umount \
-    mkfs.ext4 \
-    mkswap \
-    sfdisk \
-    partprobe \
-    blockdev \
-    chimera-bootstrap \
-    chimera-chroot
+    lsblk blkid mount umount mkfs.ext4 mkswap swapoff \
+    sfdisk wipefs blockdev awk sed grep tr \
+    chimera-bootstrap chimera-chroot
 do
     command -v "$cmd" >/dev/null 2>&1 ||
         die "Required command not found: $cmd"
 done
 
 # ==================================================
-# Header
+# Welcome
 # ==================================================
 
-clear
-
-echo "${BOLD}${CYAN}"
-echo "╔════════════════════════════════════════════╗"
-echo "║       Kolon Chimera Linux Installer        ║"
-echo "║                  v$VERSION                 ║"
-echo "╚════════════════════════════════════════════╝"
-echo "${RESET}"
-
+cls
+banner "Kolon Chimera Linux simple installer"
+printf '%s%s%s\n' "$CYAN" "                    v$VERSION" "$RESET"
 echo
 echo "Chimera Linux x86_64 installer"
 echo
-echo "Supported:"
-echo "  • UEFI → GPT + EFI"
-echo "  • BIOS → MBR"
-echo "  • Swap"
-echo "  • Optional hibernation"
+echo "Features:"
+echo "  • UEFI (GPT + EFI) and BIOS (MBR)"
+echo "  • Swap and optional hibernation"
+echo "  • Custom hostname, user, passwords, mirror, kernel"
+echo "  • Optional desktop environment"
 echo "  • opendoas"
-echo
 
 pause
 
 # ==================================================
-# Boot mode
+# 1. Boot mode
 # ==================================================
 
-clear
+section "1. Boot mode"
 
-echo "${BOLD}1. Boot mode${RESET}"
-echo
-
-echo "  1) UEFI"
-echo "     GPT + EFI System Partition"
-echo
-
-echo "  2) BIOS / Legacy"
-echo "     MBR"
-echo
-
-BOOTMODE="$(ask "Choice [1-2]: ")"
-
-case "$BOOTMODE" in
-    1)
-        BOOTMODE="UEFI"
-        ;;
-    2)
-        BOOTMODE="BIOS"
-        ;;
-    *)
-        die "Invalid boot mode."
-        ;;
-esac
-
-success "Selected boot mode: $BOOTMODE"
-
-pause
-
-# ==================================================
-# Network
-# ==================================================
-
-clear
-
-echo "${BOLD}2. Network${RESET}"
-echo
-
-info "Checking network..."
-
-if command -v ping >/dev/null 2>&1; then
-    if ping -c 1 -W 3 repo.chimera-linux.org >/dev/null 2>&1; then
-        success "Network is reachable."
-    else
-        warning "Could not reach repo.chimera-linux.org."
-        echo "Check your network before continuing."
-    fi
+if [ -d /sys/firmware/efi ]; then
+    DEFAULT_BOOT=1
+    echo "Detected: UEFI firmware"
 else
-    warning "ping is not available."
+    DEFAULT_BOOT=2
+    echo "Detected: BIOS / Legacy firmware"
 fi
 
-pause
-
-# ==================================================
-# Disk
-# ==================================================
-
-clear
-
-echo "${BOLD}3. Installation disk${RESET}"
+echo
+echo "  1) UEFI    (GPT + EFI System Partition)"
+echo "  2) BIOS    (MBR)"
 echo
 
-lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
+BOOTCHOICE="$(ask_default "Choice [1-2]" "$DEFAULT_BOOT")"
 
+case "$BOOTCHOICE" in
+    1) BOOTMODE="UEFI" ;;
+    2) BOOTMODE="BIOS" ;;
+    *) die "Invalid boot mode." ;;
+esac
+
+if [ "$BOOTMODE" = "UEFI" ]; then
+    command -v mkfs.vfat >/dev/null 2>&1 ||
+        die "mkfs.vfat (dosfstools) is required for UEFI."
+
+    [ -d /sys/firmware/efi ] ||
+        warning "The live system was NOT booted in UEFI mode. GRUB will still install a removable fallback, but check your firmware settings."
+fi
+
+success "Boot mode: $BOOTMODE"
+
+# ==================================================
+# 2. Disk
+# ==================================================
+
+section "2. Installation disk"
+
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MODEL,MOUNTPOINTS
 echo
 
-DISK="$(ask "Installation disk (example: /dev/sdc): ")"
+DISK="$(ask "Installation disk (example: /dev/sda, /dev/nvme0n1): ")"
 DISK="$(printf '%s' "$DISK" | tr -d '[:space:]')"
 
-[ -b "$DISK" ] ||
-    die "Disk does not exist: $DISK"
-
 case "$DISK" in
-    /dev/*)
-        ;;
-    *)
-        die "Invalid disk path."
-        ;;
+    /dev/*) ;;
+    *) die "Invalid disk path (must start with /dev/)." ;;
 esac
 
-echo
-success "Selected disk: $DISK"
-echo
+[ -b "$DISK" ] || die "Disk does not exist: $DISK"
 
+DISK_TYPE="$(lsblk -dno TYPE "$DISK" 2>/dev/null || true)"
+
+case "$DISK_TYPE" in
+    disk|loop) ;;
+    *) die "$DISK is not a whole disk (type: ${DISK_TYPE:-unknown}). Select the disk, not a partition." ;;
+esac
+
+# Refuse to touch the disk we are running from
+for part in $(lsblk -nlo PATH "$DISK"); do
+    if is_mounted_at_root "$part"; then
+        die "$part is the running system's root. Choose another disk."
+    fi
+done
+
+DISK_MIB=$(( $(blockdev --getsize64 "$DISK") / 1048576 ))
+
+echo
+success "Selected disk: $DISK (${DISK_MIB} MiB)"
+echo
 warning "ALL DATA ON $DISK WILL BE DESTROYED."
 
-if ! yesno "Continue with $DISK?"; then
-    echo "Installation cancelled."
-    exit 0
-fi
+yesno "Continue with $DISK?" || { echo "Installation cancelled."; exit 0; }
 
 # ==================================================
-# Swap
+# 3. Swap
 # ==================================================
 
-clear
+section "3. Swap"
 
-echo "${BOLD}4. Swap${RESET}"
-echo
+RAM_MIB="$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)"
+RAM_GIB=$(( (RAM_MIB + 1023) / 1024 ))
 
-echo "Choose swap configuration:"
+echo "Detected RAM: ${RAM_MIB} MiB"
 echo
 echo "  1) No swap"
 echo "  2) Swap without hibernation"
-echo "  3) Swap + hibernation"
+echo "  3) Swap + hibernation (swap should be >= RAM)"
 echo
 
-SWAPCHOICE=$(ask "Choice [1-3]: ")
+SWAPCHOICE="$(ask "Choice [1-3]: ")"
+
+SWAP_MODE="NONE"
+SWAP_SIZE=""
+SWAP_MIB=0
 
 case "$SWAPCHOICE" in
     1)
         SWAP_MODE="NONE"
-        SWAP_SIZE=""
         ;;
-    2)
-        SWAP_MODE="SWAP"
-        SWAP_SIZE=$(ask "Swap size [4G]: ")
-        SWAP_SIZE=${SWAP_SIZE:-4G}
-        ;;
-    3)
-        SWAP_MODE="HIBERNATE"
-        SWAP_SIZE=$(ask "Swap size [8G]: ")
-        SWAP_SIZE=${SWAP_SIZE:-8G}
+    2|3)
+        if [ "$SWAPCHOICE" = "2" ]; then
+            SWAP_MODE="SWAP"
+            SWAP_DEFAULT="4G"
+        else
+            SWAP_MODE="HIBERNATE"
+            SWAP_DEFAULT="${RAM_GIB}G"
+        fi
+
+        while true; do
+            SWAP_SIZE="$(ask_default "Swap size (e.g. 4G, 512M)" "$SWAP_DEFAULT")"
+
+            if SWAP_MIB="$(parse_size_mib "$SWAP_SIZE")" && [ "$SWAP_MIB" -ge 256 ]; then
+                break
+            fi
+
+            warning "Invalid swap size. Use a number with M or G (minimum 256M)."
+        done
+
+        if [ "$SWAP_MODE" = "HIBERNATE" ] && [ "$SWAP_MIB" -lt "$RAM_MIB" ]; then
+            warning "Swap (${SWAP_MIB} MiB) is smaller than RAM (${RAM_MIB} MiB). Hibernation may fail."
+            yesno "Continue anyway?" || die "Aborted. Re-run and choose a larger swap."
+        fi
         ;;
     *)
         die "Invalid swap choice."
         ;;
 esac
 
-echo
+# Disk space check: ESP + swap + at least 8 GiB for root
+NEEDED_MIB=$(( SWAP_MIB + 8192 ))
+[ "$BOOTMODE" = "UEFI" ] && NEEDED_MIB=$(( NEEDED_MIB + 512 ))
+
+[ "$DISK_MIB" -ge "$NEEDED_MIB" ] ||
+    die "Disk is too small. Need at least ${NEEDED_MIB} MiB, have ${DISK_MIB} MiB."
 
 case "$SWAP_MODE" in
-    NONE)
-        success "Swap disabled."
-        ;;
-    SWAP)
-        success "Swap enabled: $SWAP_SIZE"
-        ;;
-    HIBERNATE)
-        success "Swap + hibernation enabled: $SWAP_SIZE"
-        ;;
-esac
-
-pause
-
-# ==================================================
-# Hostname
-# ==================================================
-
-clear
-
-echo "${BOLD}5. PC name${RESET}"
-echo
-
-HOSTNAME="$(ask "PC name [chimera]: ")"
-HOSTNAME=${HOSTNAME:-chimera}
-
-case "$HOSTNAME" in
-    *[!a-zA-Z0-9_-]*)
-        die "Invalid hostname."
-        ;;
+    NONE)      success "Swap disabled." ;;
+    SWAP)      success "Swap enabled: $SWAP_SIZE" ;;
+    HIBERNATE) success "Swap + hibernation enabled: $SWAP_SIZE" ;;
 esac
 
 # ==================================================
-# User
+# 4. Hostname
 # ==================================================
 
-clear
+section "4. PC name (hostname)"
 
-echo "${BOLD}6. User account${RESET}"
-echo
-
-USERNAME="$(ask "Username [kolon]: ")"
-USERNAME=${USERNAME:-kolon}
-
-case "$USERNAME" in
-    *[!a-zA-Z0-9_-]*)
-        die "Invalid username."
-        ;;
-esac
+while true; do
+    HOSTNAME="$(ask_default "PC name" "chimera")"
+    valid_hostname "$HOSTNAME" && break
+    warning "Invalid hostname. Use letters, digits and '-' (max 63 chars)."
+done
 
 # ==================================================
-# User password
+# 5. User and passwords
 # ==================================================
 
-echo
+section "5. User account"
 
-USERPASS="$(ask_password "User password: ")"
-
-[ -n "$USERPASS" ] ||
-    die "User password cannot be empty."
-
-USERPASS2="$(ask_password "Repeat user password: ")"
-
-[ "$USERPASS" = "$USERPASS2" ] ||
-    die "User passwords do not match."
-
-# ==================================================
-# Root password
-# ==================================================
+while true; do
+    USERNAME="$(ask_default "Username" "kolon")"
+    valid_username "$USERNAME" && break
+    warning "Invalid username. Use lowercase letters, digits, '_' or '-'; must not be 'root'."
+done
 
 echo
-
-ROOTPASS="$(ask_password "Root password: ")"
-
-[ -n "$ROOTPASS" ] ||
-    die "Root password cannot be empty."
-
-ROOTPASS2="$(ask_password "Repeat root password: ")"
-
-[ "$ROOTPASS" = "$ROOTPASS2" ] ||
-    die "Root passwords do not match."
-
-# ==================================================
-# Repository
-# ==================================================
-
-clear
-
-echo "${BOLD}7. Repository${RESET}"
+USERPASS="$(ask_new_password "User")"
 echo
+ROOTPASS="$(ask_new_password "Root")"
 
-echo "  1) Official Chimera repository"
+# ==================================================
+# 6. Timezone
+# ==================================================
+
+section "6. Timezone"
+
+while true; do
+    TIMEZONE="$(ask_default "Timezone (e.g. UTC, Europe/Berlin, America/New_York)" "UTC")"
+    valid_timezone "$TIMEZONE" && break
+    warning "Invalid timezone string."
+done
+
+# ==================================================
+# 7. Repository
+# ==================================================
+
+section "7. Repository"
+
+echo "  1) Official Chimera repository ($OFFICIAL_REPO)"
 echo "  2) Custom mirror"
 echo
 
@@ -395,13 +512,16 @@ REPOCHOICE="$(ask "Choice [1-2]: ")"
 
 case "$REPOCHOICE" in
     1)
-        MIRROR="https://repo.chimera-linux.org"
+        MIRROR="$OFFICIAL_REPO"
         ;;
     2)
-        MIRROR="$(ask "Mirror URL: ")"
+        while true; do
+            MIRROR="$(ask "Mirror URL (https://...): ")"
+            MIRROR="$(printf '%s' "$MIRROR" | tr -d '[:space:]' | sed 's|/*$||')"
 
-        [ -n "$MIRROR" ] ||
-            die "Mirror URL cannot be empty."
+            printf '%s' "$MIRROR" | grep -Eq '^https?://[^/]+' && break
+            warning "Mirror URL must start with http:// or https://"
+        done
         ;;
     *)
         die "Invalid repository choice."
@@ -409,13 +529,10 @@ case "$REPOCHOICE" in
 esac
 
 # ==================================================
-# Kernel
+# 8. Kernel
 # ==================================================
 
-clear
-
-echo "${BOLD}8. Kernel${RESET}"
-echo
+section "8. Kernel"
 
 echo "  1) linux-lts"
 echo "  2) linux-stable"
@@ -424,27 +541,18 @@ echo
 KERNELCHOICE="$(ask "Choice [1-2]: ")"
 
 case "$KERNELCHOICE" in
-    1)
-        KERNEL="linux-lts"
-        ;;
-    2)
-        KERNEL="linux-stable"
-        ;;
-    *)
-        die "Invalid kernel choice."
-        ;;
+    1) KERNEL="linux-lts" ;;
+    2) KERNEL="linux-stable" ;;
+    *) die "Invalid kernel choice." ;;
 esac
 
 # ==================================================
-# Desktop
+# 9. Desktop environment
 # ==================================================
 
-clear
+section "9. Desktop environment"
 
-echo "${BOLD}9. Desktop environment${RESET}"
-echo
-
-echo "  1) None"
+echo "  1) None (console only)"
 echo "  2) KDE Plasma"
 echo "  3) GNOME"
 echo "  4) XFCE"
@@ -452,18 +560,27 @@ echo
 
 DESKTOPCHOICE="$(ask "Choice [1-4]: ")"
 
+DESKTOP_NAME="none"
+DESKTOP_PKGS=""
+DESKTOP_DM=""
+
 case "$DESKTOPCHOICE" in
     1)
-        DESKTOP=""
         ;;
     2)
-        DESKTOP="plasma-desktop-meta"
+        DESKTOP_NAME="KDE Plasma"
+        DESKTOP_PKGS="plasma-desktop-meta plasma-desktop konsole sddm"
+        DESKTOP_DM="sddm"
         ;;
     3)
-        DESKTOP="gnome"
+        DESKTOP_NAME="GNOME"
+        DESKTOP_PKGS="gnome gdm"
+        DESKTOP_DM="gdm"
         ;;
     4)
-        DESKTOP="xfce4-session xfce4-panel xfdesktop xfwm4"
+        DESKTOP_NAME="XFCE"
+        DESKTOP_PKGS="xfce4-session xfce4-panel xfdesktop xfwm4 xfce4-settings xfce4-terminal thunar lightdm lightdm-gtk-greeter"
+        DESKTOP_DM="lightdm"
         ;;
     *)
         die "Invalid desktop choice."
@@ -474,32 +591,23 @@ esac
 # Summary
 # ==================================================
 
-clear
-
-echo "${BOLD}${CYAN}"
-echo "╔════════════════════════════════════════════╗"
-echo "║             INSTALLATION SUMMARY           ║"
-echo "╚════════════════════════════════════════════╝"
-echo "${RESET}"
-
+cls
+banner "INSTALLATION SUMMARY"
 echo
 echo "Architecture: $ARCH"
 echo "Boot mode:    $BOOTMODE"
 echo "Disk:         $DISK"
 
 if [ "$BOOTMODE" = "UEFI" ]; then
-    echo "Partition:    GPT"
+    echo "Partitions:   GPT (EFI 512M + root$([ "$SWAP_MODE" != "NONE" ] && printf ' + swap'))"
 else
-    echo "Partition:    MBR"
+    echo "Partitions:   MBR (root$([ "$SWAP_MODE" != "NONE" ] && printf ' + swap'))"
 fi
-
-echo
 
 if [ "$SWAP_MODE" = "NONE" ]; then
     echo "Swap:         disabled"
 else
     echo "Swap:         $SWAP_SIZE"
-
     if [ "$SWAP_MODE" = "HIBERNATE" ]; then
         echo "Hibernation:  enabled"
     else
@@ -510,253 +618,175 @@ fi
 echo
 echo "Hostname:     $HOSTNAME"
 echo "Username:     $USERNAME"
+echo "Timezone:     $TIMEZONE"
 echo "Repository:   $MIRROR"
 echo "Kernel:       $KERNEL"
+echo "Desktop:      $DESKTOP_NAME"
+echo
+warning "The selected disk ($DISK) will be completely erased."
+echo
 
-if [ -n "$DESKTOP" ]; then
-    echo "Desktop:      $DESKTOP"
+yesno "Start installation?" || { echo "Installation cancelled."; exit 0; }
+
+# ==================================================
+# Network check (before anything is destroyed)
+# ==================================================
+
+section "10. Network"
+
+info "Checking connection to $MIRROR ..."
+
+network_ok() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSI --max-time 15 "$MIRROR" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --spider -T 15 "$MIRROR" >/dev/null 2>&1
+    elif command -v ping >/dev/null 2>&1; then
+        _host="${MIRROR#*://}"
+        _host="${_host%%/*}"
+        _host="${_host%%:*}"
+        ping -c 1 -W 3 "$_host" >/dev/null 2>&1
+    else
+        return 0
+    fi
+}
+
+if network_ok; then
+    success "Repository is reachable."
 else
-    echo "Desktop:      none"
-fi
-
-echo
-warning "The selected disk will be completely erased."
-echo
-
-if ! yesno "Start installation?"; then
-    echo "Installation cancelled."
-    exit 0
+    warning "Could not reach $MIRROR."
+    yesno "Continue anyway?" || die "Check your network connection and try again."
 fi
 
 # ==================================================
 # Partitioning
 # ==================================================
 
-clear
+INSTALL_STARTED=1
 
-echo "${BOLD}10. Partitioning${RESET}"
-echo
+section "11. Partitioning"
 
-info "Unmounting existing partitions from $DISK..."
+info "Unmounting anything on $DISK and $MNT ..."
 
-# Don't fail if nothing is mounted.
-umount "${DISK}"* 2>/dev/null || true
+umount -R "$MNT" 2>/dev/null || true
+
+for part in $(lsblk -nlo PATH "$DISK" | sort -r); do
+    swapoff "$part" 2>/dev/null || true
+    umount "$part" 2>/dev/null || true
+
+    if is_mounted "$part"; then
+        die "Could not unmount $part. Unmount it manually and retry."
+    fi
+done
 
 sync
 
-# --------------------------------------------------
-# UEFI / GPT
-# --------------------------------------------------
+info "Wiping old signatures..."
+
+for part in $(lsblk -nlo PATH "$DISK" | sort -r); do
+    wipefs -af "$part" >/dev/null 2>&1 || true
+done
+
+wipefs -af "$DISK" >/dev/null
+
+ESP=""
+SWAP=""
+
+# Layout (sizes in 512-byte sectors; 1 MiB = 2048 sectors)
+SWAP_SECTORS=$(( SWAP_MIB * 2048 ))
 
 if [ "$BOOTMODE" = "UEFI" ]; then
 
-    command -v sgdisk >/dev/null 2>&1 ||
-        die "sgdisk is required for GPT partitioning."
-
-    command -v mkfs.vfat >/dev/null 2>&1 ||
-        die "mkfs.vfat is required for UEFI."
-
-    info "Creating GPT..."
-
-    sgdisk --zap-all "$DISK"
-
-    # EFI
-    sgdisk \
-        -n 1:0:+512M \
-        -t 1:EF00 \
-        -c 1:"EFI System Partition" \
-        "$DISK"
-
-    PARTNUM=2
-
-    # Swap
-    if [ "$SWAP_MODE" != "NONE" ]; then
-
-        SWAP_BYTES="$(numfmt --from=iec "$SWAP_SIZE")"
-        SWAP_SECTORS=$((SWAP_BYTES / 512))
-
-        [ "$SWAP_SECTORS" -gt 0 ] ||
-            die "Invalid swap size."
-
-        sgdisk \
-            -n "${PARTNUM}:0:+${SWAP_SECTORS}S" \
-            -t "${PARTNUM}:8200" \
-            -c "${PARTNUM}:Chimera Swap" \
-            "$DISK"
-
-        SWAPNUM="$PARTNUM"
-        PARTNUM=$((PARTNUM + 1))
-    fi
-
-    # Root
-    sgdisk \
-        -n "${PARTNUM}:0:0" \
-        -t "${PARTNUM}:8300" \
-        -c "${PARTNUM}:Chimera Root" \
-        "$DISK"
-
-    ROOTNUM="$PARTNUM"
-
-    sync
-
-    partprobe "$DISK" 2>/dev/null || true
-    sleep 2
-
-    case "$DISK" in
-        /dev/nvme*|/dev/mmcblk*)
-            ESP="${DISK}p1"
-            ROOT="${DISK}p${ROOTNUM}"
-
-            if [ "$SWAP_MODE" != "NONE" ]; then
-                SWAP="${DISK}p${SWAPNUM}"
-            fi
-            ;;
-        *)
-            ESP="${DISK}1"
-            ROOT="${DISK}${ROOTNUM}"
-
-            if [ "$SWAP_MODE" != "NONE" ]; then
-                SWAP="${DISK}${SWAPNUM}"
-            fi
-            ;;
-    esac
-
-    [ -b "$ESP" ] || die "EFI partition not found: $ESP"
-    [ -b "$ROOT" ] || die "Root partition not found: $ROOT"
+    info "Creating GPT partition table..."
 
     if [ "$SWAP_MODE" != "NONE" ]; then
-        [ -b "$SWAP" ] || die "Swap partition not found: $SWAP"
+        sfdisk --quiet "$DISK" <<EOF
+label: gpt
+start=2048, size=1048576, type=U, name="EFI System Partition"
+size=$SWAP_SECTORS, type=S, name="Chimera Swap"
+type=L, name="Chimera Root"
+EOF
+        ESP="$(part_path 1)"
+        SWAP="$(part_path 2)"
+        ROOT="$(part_path 3)"
+    else
+        sfdisk --quiet "$DISK" <<EOF
+label: gpt
+start=2048, size=1048576, type=U, name="EFI System Partition"
+type=L, name="Chimera Root"
+EOF
+        ESP="$(part_path 1)"
+        ROOT="$(part_path 2)"
     fi
-
-    info "Formatting EFI..."
-
-    mkfs.vfat -F 32 "$ESP"
-
-    if [ "$SWAP_MODE" != "NONE" ]; then
-        info "Formatting swap..."
-        mkswap "$SWAP"
-    fi
-
-    info "Formatting root..."
-
-    mkfs.ext4 -F "$ROOT"
-
-# --------------------------------------------------
-# BIOS / MBR
-# --------------------------------------------------
 
 else
 
-    info "Creating MBR..."
-
-    DISK_SECTORS="$(blockdev --getsz "$DISK")"
-
-    FIRST_SECTOR=2048
+    info "Creating MBR partition table..."
 
     if [ "$SWAP_MODE" != "NONE" ]; then
-
-        SWAP_BYTES="$(numfmt --from=iec "$SWAP_SIZE")"
-        SWAP_SECTORS=$((SWAP_BYTES / 512))
-
-        [ "$SWAP_SECTORS" -gt 0 ] ||
-            die "Invalid swap size."
-
-        SWAP_START="$FIRST_SECTOR"
-        ROOT_START=$((SWAP_START + SWAP_SECTORS))
-
-        ROOT_SIZE=$((DISK_SECTORS - ROOT_START))
-
-        [ "$ROOT_SIZE" -gt 2048 ] ||
-            die "Not enough space for root partition."
-
-        sfdisk "$DISK" <<EOF
+        sfdisk --quiet "$DISK" <<EOF
 label: dos
-unit: sectors
-
-start=$SWAP_START,size=$SWAP_SECTORS,type=82
-start=$ROOT_START,size=$ROOT_SIZE,type=83,bootable
+start=2048, size=$SWAP_SECTORS, type=S
+type=L, bootable
 EOF
-
-        case "$DISK" in
-            /dev/nvme*|/dev/mmcblk*)
-                SWAP="${DISK}p1"
-                ROOT="${DISK}p2"
-                ;;
-            *)
-                SWAP="${DISK}1"
-                ROOT="${DISK}2"
-                ;;
-        esac
-
+        SWAP="$(part_path 1)"
+        ROOT="$(part_path 2)"
     else
-
-        sfdisk "$DISK" <<EOF
+        sfdisk --quiet "$DISK" <<EOF
 label: dos
-unit: sectors
-
-start=$FIRST_SECTOR,type=83,bootable
+start=2048, type=L, bootable
 EOF
-
-        case "$DISK" in
-            /dev/nvme*|/dev/mmcblk*)
-                ROOT="${DISK}p1"
-                ;;
-            *)
-                ROOT="${DISK}1"
-                ;;
-        esac
-
+        ROOT="$(part_path 1)"
     fi
-
-    sync
-
-    partprobe "$DISK" 2>/dev/null || true
-    sleep 2
-
-    [ -b "$ROOT" ] ||
-        die "Root partition not found: $ROOT"
-
-    if [ "$SWAP_MODE" != "NONE" ]; then
-        [ -b "$SWAP" ] ||
-            die "Swap partition not found: $SWAP"
-    fi
-
-    if [ "$SWAP_MODE" != "NONE" ]; then
-        info "Formatting swap..."
-        mkswap "$SWAP"
-    fi
-
-    info "Formatting root..."
-
-    mkfs.ext4 -F "$ROOT"
 
 fi
+
+sync
+
+blockdev --rereadpt "$DISK" 2>/dev/null || true
+command -v partprobe >/dev/null 2>&1 && partprobe "$DISK" 2>/dev/null || true
+command -v udevadm >/dev/null 2>&1 && udevadm settle 2>/dev/null || true
+
+wait_for_block "$ROOT"
+[ -z "$ESP" ]  || wait_for_block "$ESP"
+[ -z "$SWAP" ] || wait_for_block "$SWAP"
+
+if [ -n "$ESP" ]; then
+    info "Formatting EFI partition ($ESP)..."
+    mkfs.vfat -F 32 -n EFI "$ESP" >/dev/null
+fi
+
+if [ -n "$SWAP" ]; then
+    info "Formatting swap ($SWAP)..."
+    mkswap -L swap "$SWAP" >/dev/null
+fi
+
+info "Formatting root ($ROOT)..."
+mkfs.ext4 -F -q -L Chimera "$ROOT"
 
 success "Partitioning complete."
 
 # ==================================================
-# Mount
+# Mounting
 # ==================================================
 
-clear
+section "12. Mounting"
 
-echo "${BOLD}11. Mounting${RESET}"
-echo
-
-mkdir -p /media/root
+mkdir -p "$MNT"
 
 info "Mounting root..."
-
-mount "$ROOT" /media/root
+mount "$ROOT" "$MNT"
 
 if [ "$BOOTMODE" = "UEFI" ]; then
-
-    mkdir -p /media/root/boot/efi
-
     info "Mounting EFI..."
+    mkdir -p "$MNT/boot/efi"
+    mount "$ESP" "$MNT/boot/efi"
 
-    mount "$ESP" /media/root/boot/efi
-
+    # Needed for grub-install to create the NVRAM boot entry
+    if [ -d /sys/firmware/efi/efivars ] &&
+       ! mountpoint -q /sys/firmware/efi/efivars 2>/dev/null; then
+        mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
+    fi
 fi
 
 success "Filesystems mounted."
@@ -765,300 +795,260 @@ success "Filesystems mounted."
 # Bootstrap
 # ==================================================
 
-clear
+section "13. Installing Chimera base system"
 
-echo "${BOLD}12. Installing Chimera${RESET}"
-echo
+info "Bootstrapping Chimera Linux (this may take a while)..."
 
-info "Bootstrapping Chimera Linux..."
-
-chimera-bootstrap /media/root
+# Honoured by chimera-bootstrap/apk when a custom mirror is chosen
+CHIMERA_REPO_URL="$MIRROR" chimera-bootstrap "$MNT"
 
 success "Base system installed."
+
+# Make sure DNS works inside the chroot
+if [ ! -s "$MNT/etc/resolv.conf" ] && [ -r /etc/resolv.conf ]; then
+    cp -L /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
+fi
 
 # ==================================================
 # Repository configuration
 # ==================================================
 
-info "Configuring repository..."
+if [ "$MIRROR" != "$OFFICIAL_REPO" ]; then
+    info "Configuring custom mirror..."
 
-mkdir -p /media/root/etc/apk/repositories.d
+    MIRROR_ESC="$(printf '%s' "$MIRROR" | sed 's/[&|\\]/\\&/g')"
 
-cat > /media/root/etc/apk/repositories.d/00-kolon-installer.list <<EOF
-set CHIMERA_REPO_URL=$MIRROR
-EOF
+    for f in "$MNT"/etc/apk/repositories.d/*.list; do
+        [ -f "$f" ] || continue
+        sed -i "s|$OFFICIAL_REPO|$MIRROR_ESC|g" "$f"
+    done
 
-success "Repository configured."
+    success "Mirror configured."
+fi
 
 # ==================================================
-# Update
+# System configuration (before kernel install)
 # ==================================================
 
-info "Updating package database..."
+section "14. Configuring system"
 
-chimera-chroot /media/root /bin/sh <<'EOF'
-set -e
+info "Setting hostname..."
+printf '%s\n' "$HOSTNAME" > "$MNT/etc/hostname"
 
-apk update
-apk upgrade --available
+info "Setting timezone..."
+in_chroot <<EOF
+if [ -f "/usr/share/zoneinfo/$TIMEZONE" ]; then
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+    echo "Timezone set to $TIMEZONE"
+else
+    echo "WARNING: timezone '$TIMEZONE' not found, keeping default."
+fi
 EOF
+
+info "Creating /etc/fstab..."
+
+ROOT_UUID="$(blkid -s UUID -o value "$ROOT")"
+[ -n "$ROOT_UUID" ] || die "Could not determine root UUID."
+
+printf 'UUID=%s  /  ext4  defaults,noatime  0 1\n' "$ROOT_UUID" > "$MNT/etc/fstab"
+
+if [ "$BOOTMODE" = "UEFI" ]; then
+    EFI_UUID="$(blkid -s UUID -o value "$ESP")"
+    [ -n "$EFI_UUID" ] || die "Could not determine EFI UUID."
+
+    printf 'UUID=%s  /boot/efi  vfat  defaults,umask=0077  0 2\n' "$EFI_UUID" \
+        >> "$MNT/etc/fstab"
+fi
+
+SWAP_UUID=""
+
+if [ "$SWAP_MODE" != "NONE" ]; then
+    SWAP_UUID="$(blkid -s UUID -o value "$SWAP")"
+    [ -n "$SWAP_UUID" ] || die "Could not determine swap UUID."
+
+    printf 'UUID=%s  none  swap  sw  0 0\n' "$SWAP_UUID" >> "$MNT/etc/fstab"
+fi
+
+success "fstab configured."
+
+# Resume device must be known before the initramfs is generated
+if [ "$SWAP_MODE" = "HIBERNATE" ]; then
+    info "Configuring resume for hibernation..."
+
+    mkdir -p "$MNT/etc/initramfs-tools/conf.d"
+    printf 'RESUME=UUID=%s\n' "$SWAP_UUID" > "$MNT/etc/initramfs-tools/conf.d/resume"
+fi
 
 # ==================================================
 # Packages
 # ==================================================
 
-info "Installing kernel and utilities..."
+section "15. Installing packages"
 
-chimera-chroot /media/root /bin/sh <<EOF
-set -e
+info "Updating package database..."
 
-apk add \
-    "$KERNEL" \
-    opendoas \
-    bash \
-    nano \
-    curl \
-    wget \
-    git
+in_chroot <<'EOF'
+apk update
+apk upgrade --available
 EOF
+
+info "Installing kernel and base utilities..."
+
+in_chroot <<EOF
+apk add "$KERNEL" opendoas bash nano curl wget git
+EOF
+
+info "Installing network manager..."
+install_optional_pkgs "networkmanager"
+enable_service networkmanager NetworkManager
 
 success "Base packages installed."
 
 # ==================================================
-# Doas
+# doas
 # ==================================================
 
 info "Configuring doas..."
 
-cat > /media/root/etc/doas.conf <<EOF
-permit persist :wheel
-EOF
-
-chmod 600 /media/root/etc/doas.conf
+printf 'permit persist :wheel\n' > "$MNT/etc/doas.conf"
+chmod 600 "$MNT/etc/doas.conf"
 
 success "doas configured."
 
 # ==================================================
-# Hostname
+# Users
 # ==================================================
 
-info "Setting hostname..."
+info "Creating user '$USERNAME'..."
 
-printf '%s\n' "$HOSTNAME" > /media/root/etc/hostname
+in_chroot <<EOF
+groups=""
+for g in wheel audio video input network plugdev; do
+    if getent group "\$g" >/dev/null 2>&1; then
+        groups="\${groups:+\$groups,}\$g"
+    fi
+done
 
-# ==================================================
-# User
-# ==================================================
-
-info "Creating user..."
-
-# Pass passwords through environment instead of putting
-# them directly into the shell command line.
-USERPASS="$USERPASS" ROOTPASS="$ROOTPASS" \
-USERNAME="$USERNAME" \
-chimera-chroot /media/root /bin/sh <<'EOF'
-set -e
-
-echo "root:$ROOTPASS" | chpasswd
-
-if ! id "$USERNAME" >/dev/null 2>&1; then
-    adduser -D -s /bin/bash "$USERNAME"
+if command -v useradd >/dev/null 2>&1; then
+    useradd -m -s /bin/bash ${USERNAME}
+    if [ -n "\$groups" ]; then
+        usermod -aG "\$groups" ${USERNAME}
+    fi
+else
+    adduser -D -s /bin/bash ${USERNAME}
+    for g in \$(echo "\$groups" | tr ',' ' '); do
+        addgroup ${USERNAME} "\$g" || true
+    done
 fi
-
-echo "$USERNAME:$USERPASS" | chpasswd
-
-addgroup "$USERNAME" wheel 2>/dev/null || true
-addgroup "$USERNAME" network 2>/dev/null || true
-addgroup "$USERNAME" audio 2>/dev/null || true
-addgroup "$USERNAME" video 2>/dev/null || true
 EOF
 
-success "User configured."
+# Passwords are piped through stdin: never on a command line or in a file.
+printf '%s:%s\n' "root" "$ROOTPASS" | chimera-chroot "$MNT" chpasswd
+printf '%s:%s\n' "$USERNAME" "$USERPASS" | chimera-chroot "$MNT" chpasswd
 
-# ==================================================
-# fstab
-# ==================================================
+# Do not keep passwords around longer than needed
+USERPASS=""
+ROOTPASS=""
 
-info "Creating /etc/fstab..."
-
-ROOT_UUID="$(blkid -s UUID -o value "$ROOT")"
-
-[ -n "$ROOT_UUID" ] ||
-    die "Could not determine root UUID."
-
-cat > /media/root/etc/fstab <<EOF
-UUID=$ROOT_UUID    /    ext4    defaults    0 1
-EOF
-
-if [ "$BOOTMODE" = "UEFI" ]; then
-
-    EFI_UUID="$(blkid -s UUID -o value "$ESP")"
-
-    [ -n "$EFI_UUID" ] ||
-        die "Could not determine EFI UUID."
-
-    cat >> /media/root/etc/fstab <<EOF
-UUID=$EFI_UUID    /boot/efi    vfat    defaults    0 2
-EOF
-
-fi
-
-if [ "$SWAP_MODE" != "NONE" ]; then
-
-    SWAP_UUID="$(blkid -s UUID -o value "$SWAP")"
-
-    [ -n "$SWAP_UUID" ] ||
-        die "Could not determine swap UUID."
-
-    cat >> /media/root/etc/fstab <<EOF
-UUID=$SWAP_UUID    none    swap    defaults    0 0
-EOF
-
-fi
-
-success "fstab configured."
+success "Users configured."
 
 # ==================================================
 # Desktop
 # ==================================================
 
-if [ -n "$DESKTOP" ]; then
+if [ -n "$DESKTOP_PKGS" ]; then
+    section "16. Desktop environment ($DESKTOP_NAME)"
 
-    info "Installing desktop environment..."
+    info "Installing desktop packages..."
+    install_optional_pkgs "$DESKTOP_PKGS"
 
-    # Split package list safely.
-    chimera-chroot /media/root /bin/sh -c \
-        "apk add $DESKTOP"
+    info "Enabling display manager ($DESKTOP_DM)..."
+    enable_service "$DESKTOP_DM"
 
     success "Desktop environment installed."
-
 fi
 
 # ==================================================
-# Hibernation
+# Bootloader
 # ==================================================
 
-if [ "$SWAP_MODE" = "HIBERNATE" ]; then
+section "17. Bootloader"
 
-    SWAP_UUID="$(blkid -s UUID -o value "$SWAP")"
+info "Installing GRUB package..."
 
-    [ -n "$SWAP_UUID" ] ||
-        die "Could not determine swap UUID."
-
-    info "Configuring hibernation..."
-
-    mkdir -p /media/root/etc/default
-
-    if [ -f /media/root/etc/default/grub ]; then
-
-        if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' \
-            /media/root/etc/default/grub; then
-
-            sed -i \
-                "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"resume=UUID=$SWAP_UUID\"|" \
-                /media/root/etc/default/grub
-
-        else
-
-            printf '%s\n' \
-                "GRUB_CMDLINE_LINUX_DEFAULT=\"resume=UUID=$SWAP_UUID\"" \
-                >> /media/root/etc/default/grub
-
-        fi
-
-    else
-
-        cat > /media/root/etc/default/grub <<EOF
-GRUB_CMDLINE_LINUX_DEFAULT="resume=UUID=$SWAP_UUID"
+if [ "$BOOTMODE" = "UEFI" ]; then
+    in_chroot <<'EOF'
+apk add grub-x86_64-efi
 EOF
-
-    fi
-
-    success "Hibernation configured."
-
+    install_optional_pkgs "efibootmgr"
+else
+    in_chroot <<'EOF'
+apk add grub-i386-pc
+EOF
 fi
 
-# ==================================================
-# Initramfs
-# ==================================================
+# Hibernation: append resume= to the kernel command line (keep existing options)
+if [ "$SWAP_MODE" = "HIBERNATE" ]; then
+    info "Adding resume= to GRUB kernel command line..."
+
+    GRUBCFG="$MNT/etc/default/grub"
+    mkdir -p "$MNT/etc/default"
+
+    if [ -f "$GRUBCFG" ] && grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUBCFG"; then
+        sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 resume=UUID=$SWAP_UUID\"|" "$GRUBCFG"
+    else
+        printf 'GRUB_CMDLINE_LINUX_DEFAULT="resume=UUID=%s"\n' "$SWAP_UUID" >> "$GRUBCFG"
+    fi
+fi
 
 info "Generating initramfs..."
 
-chimera-chroot /media/root /bin/sh <<'EOF'
-set -e
-
+in_chroot <<'EOF'
 update-initramfs -c -k all
 EOF
 
-success "Initramfs generated."
-
-# ==================================================
-# GRUB
-# ==================================================
-
-info "Installing GRUB..."
+info "Installing GRUB to disk..."
 
 if [ "$BOOTMODE" = "UEFI" ]; then
+    in_chroot <<'EOF'
+if ! grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+        --bootloader-id=Chimera --recheck; then
+    echo "WARNING: could not create NVRAM entry, relying on the removable fallback."
+fi
 
-    chimera-chroot /media/root /bin/sh <<'EOF'
-set -e
-
-apk add grub-x86_64-efi
-
-grub-install \
-    --target=x86_64-efi \
-    --efi-directory=/boot/efi \
-    --bootloader-id=Chimera
+# Fallback path (EFI/BOOT/BOOTX64.EFI) so the system boots even without NVRAM entry
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck
 
 update-grub
 EOF
-
 else
-
-    chimera-chroot /media/root /bin/sh <<EOF
-set -e
-
-apk add grub-i386-pc
-
-grub-install \
-    --target=i386-pc \
-    "$DISK"
-
+    in_chroot <<EOF
+grub-install --target=i386-pc --recheck "$DISK"
 update-grub
 EOF
-
 fi
 
 success "GRUB installed."
 
 # ==================================================
-# Final filesystem sync
+# Finish
 # ==================================================
 
-info "Syncing filesystem..."
-
+info "Syncing filesystems..."
 sync
 
 info "Unmounting..."
-
-umount -R /media/root 2>/dev/null || true
-
+umount -R "$MNT" 2>/dev/null || true
 sync
 
-# ==================================================
-# Complete
-# ==================================================
+INSTALL_STARTED=0
 
-clear
-
-echo "${BOLD}${GREEN}"
-echo "╔════════════════════════════════════════════╗"
-echo "║          INSTALLATION COMPLETE             ║"
-echo "╚════════════════════════════════════════════╝"
-echo "${RESET}"
-
+cls
+banner "INSTALLATION COMPLETE"
+printf '%s' "$GREEN"
 echo
 echo "Chimera Linux installation finished."
+printf '%s' "$RESET"
 echo
 echo "Architecture: $ARCH"
 echo "Boot mode:    $BOOTMODE"
@@ -1067,21 +1057,19 @@ echo "Disk:         $DISK"
 if [ "$SWAP_MODE" = "NONE" ]; then
     echo "Swap:         disabled"
 elif [ "$SWAP_MODE" = "SWAP" ]; then
-    echo "Swap:         $SWAP_SIZE"
-    echo "Hibernation:  disabled"
+    echo "Swap:         $SWAP_SIZE (hibernation disabled)"
 else
-    echo "Swap:         $SWAP_SIZE"
-    echo "Hibernation:  enabled"
+    echo "Swap:         $SWAP_SIZE (hibernation enabled)"
 fi
 
 echo
 echo "Hostname:     $HOSTNAME"
 echo "Username:     $USERNAME"
 echo "Kernel:       $KERNEL"
+echo "Desktop:      $DESKTOP_NAME"
 echo
 
 warning "Remove the installation USB before rebooting."
-
 echo
 
 if yesno "Reboot now?"; then

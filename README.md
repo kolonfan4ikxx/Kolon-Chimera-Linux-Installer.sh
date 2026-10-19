@@ -1,7 +1,3 @@
-# Kolon-Chimera-Linux-Installer.sh
-an simple user friendly installer of Chimera Linux, Tutorial in bellow
-
-
 # Kolon Chimera Linux Installer
 
 Простой интерактивный установщик Chimera Linux от Kolon.

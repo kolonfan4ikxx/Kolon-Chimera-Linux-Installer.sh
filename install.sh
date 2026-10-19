@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # ==================================================
 # Colors
@@ -56,8 +56,8 @@ pause() {
     read -r _
 }
 
-# Prompt is printed to stderr so command substitution
-# receives only the user's answer.
+# Prompt goes to stderr so $(ask "...") gets
+# only the user's answer.
 ask() {
     printf "%s" "$1" >&2
     read -r ANSWER
@@ -189,7 +189,6 @@ echo
 
 DISK=$(ask "Installation disk (example: /dev/sdc): ")
 
-# Remove whitespace accidentally entered around path.
 DISK=$(printf '%s' "$DISK" | tr -d '[:space:]')
 
 [ -b "$DISK" ] ||
@@ -208,19 +207,79 @@ if ! yesno "Use $DISK?"; then
 fi
 
 # ==================================================
+# Swap
+# ==================================================
+
+clear
+
+echo "${BOLD}4. Swap${RESET}"
+echo
+
+echo "Choose swap configuration:"
+echo
+echo "  1) No swap"
+echo "  2) Swap without hibernation"
+echo "  3) Swap + hibernation"
+echo
+
+SWAPCHOICE=$(ask "Choice [1-3]: ")
+
+case "$SWAPCHOICE" in
+    1)
+        SWAP_MODE="NONE"
+        SWAP_SIZE=""
+        ;;
+    2)
+        SWAP_MODE="SWAP"
+        SWAP_SIZE=$(ask "Swap size [4G]: ")
+        SWAP_SIZE=${SWAP_SIZE:-4G}
+        ;;
+    3)
+        SWAP_MODE="HIBERNATE"
+        SWAP_SIZE=$(ask "Swap size [8G]: ")
+        SWAP_SIZE=${SWAP_SIZE:-8G}
+        ;;
+    *)
+        die "Invalid swap choice."
+        ;;
+esac
+
+echo
+
+case "$SWAP_MODE" in
+    NONE)
+        success "Swap disabled."
+        ;;
+    SWAP)
+        success "Swap enabled: $SWAP_SIZE"
+        ;;
+    HIBERNATE)
+        success "Swap + hibernation enabled: $SWAP_SIZE"
+        ;;
+esac
+
+pause
+
+# ==================================================
 # Partitioning
 # ==================================================
 
 clear
 
-echo "${BOLD}4. Partitioning${RESET}"
+echo "${BOLD}5. Partitioning${RESET}"
 echo
 
 command -v fdisk >/dev/null 2>&1 ||
     die "fdisk is required."
 
+command -v sfdisk >/dev/null 2>&1 ||
+    die "sfdisk is required."
+
 command -v mkfs.ext4 >/dev/null 2>&1 ||
     die "mkfs.ext4 is required."
+
+command -v mkswap >/dev/null 2>&1 ||
+    die "mkswap is required."
 
 if [ "$BOOTMODE" = "UEFI" ]; then
 
@@ -239,7 +298,12 @@ if [ "$BOOTMODE" = "UEFI" ]; then
     echo
     echo "  $DISK"
     echo "  ├── 512 MiB EFI System Partition"
-    echo "  └── ext4 root"
+
+    if [ "$SWAP_MODE" != "NONE" ]; then
+        echo "  ├── $SWAP_SIZE Swap"
+    fi
+
+    echo "  └── ext4 Root"
     echo
 
     warning "Automatic partitioning will erase $DISK."
@@ -254,35 +318,67 @@ if [ "$BOOTMODE" = "UEFI" ]; then
 
     sgdisk --zap-all "$DISK"
 
+    # EFI
     sgdisk \
         -n 1:0:+512M \
         -t 1:ef00 \
         -c 1:"EFI System Partition" \
         "$DISK"
 
+    PARTNUM=2
+
+    # Swap
+    if [ "$SWAP_MODE" != "NONE" ]; then
+
+        command -v numfmt >/dev/null 2>&1 ||
+            die "numfmt is required for swap sizing."
+
+        SWAP_BYTES=$(numfmt --from=iec "$SWAP_SIZE")
+
+        SWAP_SECTORS=$((SWAP_BYTES / 512))
+
+        sgdisk \
+            -n "${PARTNUM}:0:+${SWAP_SECTORS}S" \
+            -t "${PARTNUM}:8200" \
+            -c "${PARTNUM}:Chimera Linux swap" \
+            "$DISK"
+
+        SWAPNUM="$PARTNUM"
+
+        PARTNUM=$((PARTNUM + 1))
+    fi
+
+    # Root
     sgdisk \
-        -n 2:0:0 \
-        -t 2:8300 \
-        -c 2:"Chimera Linux root" \
+        -n "${PARTNUM}:0:0" \
+        -t "${PARTNUM}:8300" \
+        -c "${PARTNUM}:Chimera Linux root" \
         "$DISK"
+
+    ROOTNUM="$PARTNUM"
 
     sync
 
     case "$DISK" in
         /dev/nvme*|/dev/mmcblk*)
             ESP="${DISK}p1"
-            ROOT="${DISK}p2"
+            ROOT="${DISK}p${ROOTNUM}"
+
+            if [ "$SWAP_MODE" != "NONE" ]; then
+                SWAP="${DISK}p${SWAPNUM}"
+            fi
             ;;
         *)
             ESP="${DISK}1"
-            ROOT="${DISK}2"
+            ROOT="${DISK}${ROOTNUM}"
+
+            if [ "$SWAP_MODE" != "NONE" ]; then
+                SWAP="${DISK}${SWAPNUM}"
+            fi
             ;;
     esac
 
-    if command -v partprobe >/dev/null 2>&1; then
-        partprobe "$DISK" || true
-    fi
-
+    partprobe "$DISK" 2>/dev/null || true
     sleep 2
 
     [ -b "$ESP" ] ||
@@ -291,9 +387,19 @@ if [ "$BOOTMODE" = "UEFI" ]; then
     [ -b "$ROOT" ] ||
         die "Root partition was not created: $ROOT"
 
+    if [ "$SWAP_MODE" != "NONE" ]; then
+        [ -b "$SWAP" ] ||
+            die "Swap partition was not created: $SWAP"
+    fi
+
     info "Formatting EFI partition..."
 
     "$MKFS_VFAT" -F 32 "$ESP"
+
+    if [ "$SWAP_MODE" != "NONE" ]; then
+        info "Creating swap..."
+        mkswap "$SWAP"
+    fi
 
     info "Formatting root partition..."
 
@@ -307,7 +413,12 @@ else
     echo
     echo "  $DISK"
     echo "  ├── MBR"
-    echo "  └── ext4 root"
+
+    if [ "$SWAP_MODE" != "NONE" ]; then
+        echo "  ├── $SWAP_SIZE Swap"
+    fi
+
+    echo "  └── ext4 Root"
     echo
 
     warning "Automatic partitioning will erase $DISK."
@@ -318,39 +429,83 @@ else
         exit 0
     fi
 
-    info "Creating MBR / DOS partition table..."
+    command -v numfmt >/dev/null 2>&1 ||
+        die "numfmt is required for swap sizing."
 
-    fdisk "$DISK" <<EOF
-o
-n
-p
-1
+    info "Creating MBR partition table..."
 
+    if [ "$SWAP_MODE" != "NONE" ]; then
 
-a
-1
-w
+        DISK_SECTORS=$(blockdev --getsz "$DISK")
+
+        SWAP_BYTES=$(numfmt --from=iec "$SWAP_SIZE")
+        SWAP_SECTORS=$((SWAP_BYTES / 512))
+
+        FIRST_SECTOR=2048
+
+        ROOT_START=$((FIRST_SECTOR + SWAP_SECTORS))
+
+        ROOT_SIZE=$((DISK_SECTORS - ROOT_START))
+
+        [ "$ROOT_SIZE" -gt 2048 ] ||
+            die "Not enough space for root partition."
+
+        sfdisk "$DISK" <<EOF
+label: dos
+unit: sectors
+
+start=$FIRST_SECTOR, size=$SWAP_SECTORS, type=82
+start=$ROOT_START, size=$ROOT_SIZE, type=83, bootable
 EOF
+
+        case "$DISK" in
+            /dev/nvme*|/dev/mmcblk*)
+                SWAP="${DISK}p1"
+                ROOT="${DISK}p2"
+                ;;
+            *)
+                SWAP="${DISK}1"
+                ROOT="${DISK}2"
+                ;;
+        esac
+
+    else
+
+        sfdisk "$DISK" <<EOF
+label: dos
+unit: sectors
+
+start=2048, type=83, bootable
+EOF
+
+        case "$DISK" in
+            /dev/nvme*|/dev/mmcblk*)
+                ROOT="${DISK}p1"
+                ;;
+            *)
+                ROOT="${DISK}1"
+                ;;
+        esac
+
+    fi
 
     sync
 
-    case "$DISK" in
-        /dev/nvme*|/dev/mmcblk*)
-            ROOT="${DISK}p1"
-            ;;
-        *)
-            ROOT="${DISK}1"
-            ;;
-    esac
-
-    if command -v partprobe >/dev/null 2>&1; then
-        partprobe "$DISK" || true
-    fi
-
+    partprobe "$DISK" 2>/dev/null || true
     sleep 2
 
     [ -b "$ROOT" ] ||
         die "Root partition was not created: $ROOT"
+
+    if [ "$SWAP_MODE" != "NONE" ]; then
+
+        [ -b "$SWAP" ] ||
+            die "Swap partition was not created: $SWAP"
+
+        info "Creating swap..."
+
+        mkswap "$SWAP"
+    fi
 
     info "Formatting root partition..."
 
@@ -368,7 +523,7 @@ pause
 
 clear
 
-echo "${BOLD}5. PC name${RESET}"
+echo "${BOLD}6. PC name${RESET}"
 echo
 
 HOSTNAME=$(ask "PC name [chimera]: ")
@@ -386,7 +541,7 @@ esac
 
 clear
 
-echo "${BOLD}6. User account${RESET}"
+echo "${BOLD}7. User account${RESET}"
 echo
 
 USERNAME=$(ask "Username [kolon]: ")
@@ -448,7 +603,7 @@ echo
 
 clear
 
-echo "${BOLD}7. Repository${RESET}"
+echo "${BOLD}8. Repository${RESET}"
 echo
 
 echo "  1) Official Chimera repository"
@@ -478,15 +633,11 @@ esac
 
 clear
 
-echo "${BOLD}8. Kernel${RESET}"
+echo "${BOLD}9. Kernel${RESET}"
 echo
 
 echo "  1) linux-lts"
-echo "     Long-term support kernel"
-echo
-
 echo "  2) linux-stable"
-echo "     Current stable kernel"
 echo
 
 KERNELCHOICE=$(ask "Choice [1-2]: ")
@@ -509,7 +660,7 @@ esac
 
 clear
 
-echo "${BOLD}9. Desktop environment${RESET}"
+echo "${BOLD}10. Desktop environment${RESET}"
 echo
 
 echo "  1) None"
@@ -566,6 +717,19 @@ fi
 
 echo "Root:        $ROOT"
 echo "Disk:        $DISK"
+
+if [ "$SWAP_MODE" = "NONE" ]; then
+    echo "Swap:        disabled"
+else
+    echo "Swap:        $SWAP ($SWAP_SIZE)"
+
+    if [ "$SWAP_MODE" = "HIBERNATE" ]; then
+        echo "Hibernation: enabled"
+    else
+        echo "Hibernation: disabled"
+    fi
+fi
+
 echo
 echo "PC name:     $HOSTNAME"
 echo "Username:    $USERNAME"
@@ -580,9 +744,6 @@ else
 fi
 
 echo
-echo "Passwords:   configured"
-echo
-
 warning "The selected disk will be erased."
 echo
 
@@ -666,6 +827,51 @@ EOF
 success "Basic packages installed."
 
 # ==================================================
+# Swap fstab
+# ==================================================
+
+info "Creating /etc/fstab..."
+
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT")
+
+[ -n "$ROOT_UUID" ] ||
+    die "Could not get root UUID."
+
+mkdir -p /media/root/etc
+
+cat > /media/root/etc/fstab <<EOF
+UUID=$ROOT_UUID    /    ext4    defaults    0 1
+EOF
+
+if [ "$BOOTMODE" = "UEFI" ]; then
+
+    EFI_UUID=$(blkid -s UUID -o value "$ESP")
+
+    [ -n "$EFI_UUID" ] ||
+        die "Could not get EFI UUID."
+
+    cat >> /media/root/etc/fstab <<EOF
+UUID=$EFI_UUID    /boot/efi    vfat    defaults    0 2
+EOF
+
+fi
+
+if [ "$SWAP_MODE" != "NONE" ]; then
+
+    SWAP_UUID=$(blkid -s UUID -o value "$SWAP")
+
+    [ -n "$SWAP_UUID" ] ||
+        die "Could not get swap UUID."
+
+    cat >> /media/root/etc/fstab <<EOF
+UUID=$SWAP_UUID    none    swap    defaults    0 0
+EOF
+
+fi
+
+success "/etc/fstab configured."
+
+# ==================================================
 # Desktop
 # ==================================================
 
@@ -697,6 +903,7 @@ echo "$HOSTNAME" > /etc/hostname
 echo "root:$ROOTPASS" | chpasswd
 
 adduser -D -s /bin/bash "$USERNAME"
+
 echo "$USERNAME:$USERPASS" | chpasswd
 
 addgroup "$USERNAME" wheel
@@ -705,6 +912,49 @@ addgroup "$USERNAME" audio
 EOF
 
 success "Users configured."
+
+# ==================================================
+# Hibernation
+# ==================================================
+
+if [ "$SWAP_MODE" = "HIBERNATE" ]; then
+
+    SWAP_UUID=$(blkid -s UUID -o value "$SWAP")
+
+    [ -n "$SWAP_UUID" ] ||
+        die "Could not get swap UUID."
+
+    info "Configuring hibernation..."
+
+    mkdir -p /media/root/etc/default
+
+    if [ -f /media/root/etc/default/grub ]; then
+
+        if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' \
+            /media/root/etc/default/grub; then
+
+            sed -i \
+                "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"resume=UUID=$SWAP_UUID\"|" \
+                /media/root/etc/default/grub
+
+        else
+
+            echo "GRUB_CMDLINE_LINUX_DEFAULT=\"resume=UUID=$SWAP_UUID\"" \
+                >> /media/root/etc/default/grub
+
+        fi
+
+    else
+
+        cat > /media/root/etc/default/grub <<EOF
+GRUB_CMDLINE_LINUX_DEFAULT="resume=UUID=$SWAP_UUID"
+EOF
+
+    fi
+
+    success "Hibernation resume configured."
+
+fi
 
 # ==================================================
 # Initramfs
@@ -760,7 +1010,7 @@ fi
 success "GRUB installed."
 
 # ==================================================
-# Finish
+# Final sync
 # ==================================================
 
 info "Syncing filesystem..."
@@ -770,6 +1020,10 @@ sync
 info "Unmounting filesystem..."
 
 umount -R /media/root 2>/dev/null || true
+
+# ==================================================
+# Complete
+# ==================================================
 
 clear
 
@@ -785,6 +1039,20 @@ echo
 echo "Boot mode:  $BOOTMODE"
 echo "Disk:       $DISK"
 echo "Root:       $ROOT"
+
+if [ "$SWAP_MODE" = "NONE" ]; then
+    echo "Swap:       disabled"
+else
+    echo "Swap:       $SWAP_SIZE"
+
+    if [ "$SWAP_MODE" = "HIBERNATE" ]; then
+        echo "Hibernate:  enabled"
+    else
+        echo "Hibernate:  disabled"
+    fi
+fi
+
+echo
 echo "PC name:    $HOSTNAME"
 echo "User:       $USERNAME"
 echo "Kernel:     $KERNEL"

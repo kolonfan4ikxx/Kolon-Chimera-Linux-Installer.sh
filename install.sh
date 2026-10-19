@@ -1,16 +1,17 @@
 #!/bin/sh
 #
 # Kolon Chimera Linux Installer
-# Simple interactive installer for Chimera Linux
+# UEFI: GPT + EFI
+# BIOS: MBR
 #
 
 set -eu
 
-VERSION="0.1.1"
+VERSION="0.2.0"
 
-# --------------------------------------------------
+# ==================================================
 # Colors
-# --------------------------------------------------
+# ==================================================
 
 if [ -t 1 ]; then
     RED="$(printf '\033[31m')"
@@ -28,9 +29,9 @@ else
     RESET=""
 fi
 
-# --------------------------------------------------
+# ==================================================
 # Functions
-# --------------------------------------------------
+# ==================================================
 
 die() {
     echo
@@ -56,9 +57,8 @@ pause() {
 }
 
 # IMPORTANT:
-# The prompt goes to stderr.
-# This prevents command substitution from putting
-# the prompt text into variables.
+# Prompt goes to stderr so command substitution
+# receives ONLY the user's input.
 ask() {
     printf "%s" "$1" >&2
     read -r ANSWER
@@ -84,17 +84,17 @@ yesno() {
     done
 }
 
-# --------------------------------------------------
-# Root check
-# --------------------------------------------------
+# ==================================================
+# Root
+# ==================================================
 
 if [ "$(id -u)" != "0" ]; then
     die "Please run this installer as root."
 fi
 
-# --------------------------------------------------
+# ==================================================
 # Header
-# --------------------------------------------------
+# ==================================================
 
 clear
 
@@ -105,30 +105,55 @@ echo "║                  v$VERSION                 ║"
 echo "╚════════════════════════════════════════════╝"
 echo "${RESET}"
 
+echo
 echo "Simple interactive installer for Chimera Linux."
 echo
-echo "The installer will configure:"
-echo "  • Installation disk"
-echo "  • Partitioning"
-echo "  • PC name"
-echo "  • User account"
-echo "  • User password"
-echo "  • Root password"
-echo "  • Repository"
-echo "  • Kernel"
-echo "  • Bootloader"
-echo "  • Desktop environment"
+echo "Supported boot modes:"
+echo "  • UEFI → GPT + EFI"
+echo "  • BIOS → MBR"
 echo
 
 pause
 
-# --------------------------------------------------
-# Internet
-# --------------------------------------------------
+# ==================================================
+# Detect boot mode
+# ==================================================
 
 clear
 
-echo "${BOLD}Network${RESET}"
+echo "${BOLD}Boot mode detection${RESET}"
+echo
+
+if [ -d /sys/firmware/efi ]; then
+    BOOTMODE="UEFI"
+    success "UEFI boot detected."
+else
+    BOOTMODE="BIOS"
+    success "BIOS / Legacy boot detected."
+fi
+
+echo
+echo "Installation layout:"
+echo
+
+if [ "$BOOTMODE" = "UEFI" ]; then
+    echo "  GPT"
+    echo "  ├── EFI System Partition"
+    echo "  └── ext4 root"
+else
+    echo "  MBR / DOS"
+    echo "  └── ext4 root"
+fi
+
+pause
+
+# ==================================================
+# Network
+# ==================================================
+
+clear
+
+echo "${BOLD}1. Network${RESET}"
 echo
 
 info "Checking internet connection..."
@@ -138,18 +163,18 @@ if command -v ping >/dev/null 2>&1 &&
     success "Internet connection works."
 else
     warning "Could not verify internet access."
-    echo "Make sure you have a working network connection."
+    echo "Make sure your network is working."
 fi
 
 pause
 
-# --------------------------------------------------
+# ==================================================
 # Disk
-# --------------------------------------------------
+# ==================================================
 
 clear
 
-echo "${BOLD}1. Installation disk${RESET}"
+echo "${BOLD}2. Installation disk${RESET}"
 echo
 echo "Available disks:"
 echo
@@ -158,7 +183,7 @@ lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
 
 echo
 
-DISK=$(ask "Enter installation disk (example: /dev/sda): ")
+DISK=$(ask "Installation disk (example: /dev/sdc): ")
 
 # Remove accidental whitespace
 DISK=$(printf '%s' "$DISK" | tr -d '[:space:]')
@@ -169,128 +194,180 @@ echo
 success "Selected disk: $DISK"
 echo
 
-warning "Automatic partitioning will erase the selected disk."
+warning "ALL DATA ON $DISK WILL BE DESTROYED."
 echo
 
-if ! yesno "Use $DISK?"; then
+if ! yesno "Use $DISK for Chimera Linux?"; then
     echo "Installation cancelled."
     exit 0
 fi
 
-# --------------------------------------------------
+# ==================================================
 # Partitioning
-# --------------------------------------------------
+# ==================================================
 
 clear
 
-echo "${BOLD}2. Disk partitioning${RESET}"
-echo
-echo "Choose how to prepare the disk:"
-echo
-echo "  1) Automatic"
-echo "     GPT + EFI + root"
-echo
-echo "  2) Existing partitions"
-echo "     Use partitions that already exist"
+echo "${BOLD}3. Disk partitioning${RESET}"
 echo
 
-PARTMODE=$(ask "Choice [1-2]: ")
-PARTMODE=$(printf '%s' "$PARTMODE" | tr -d '[:space:]')
+if [ "$BOOTMODE" = "UEFI" ]; then
 
-case "$PARTMODE" in
+    echo "UEFI installation:"
+    echo
+    echo "  GPT partition table"
+    echo "  512 MiB EFI System Partition"
+    echo "  Remaining space → ext4 root"
+    echo
 
-    1)
-        echo
-        warning "Automatic partitioning will erase $DISK."
-        echo
+else
 
-        if ! yesno "Are you absolutely sure?"; then
-            echo "Installation cancelled."
-            exit 0
-        fi
+    echo "BIOS installation:"
+    echo
+    echo "  MBR / DOS partition table"
+    echo "  Entire disk → ext4 root"
+    echo
 
-        command -v sgdisk >/dev/null 2>&1 ||
-            die "sgdisk is required for automatic partitioning."
+fi
 
-        command -v mkfs.vfat >/dev/null 2>&1 ||
-            die "mkfs.vfat is required."
+warning "Automatic partitioning will erase $DISK."
+echo
 
-        command -v mkfs.ext4 >/dev/null 2>&1 ||
-            die "mkfs.ext4 is required."
+if ! yesno "Continue?"; then
+    echo "Installation cancelled."
+    exit 0
+fi
 
-        info "Creating GPT partition table..."
+command -v sgdisk >/dev/null 2>&1 ||
+    [ "$BOOTMODE" = "BIOS" ] ||
+    die "sgdisk is required for UEFI partitioning."
 
-        sgdisk --zap-all "$DISK"
-        sgdisk -n 1:0:+512M -t 1:ef00 "$DISK"
-        sgdisk -n 2:0:0 -t 2:8300 "$DISK"
+command -v fdisk >/dev/null 2>&1 ||
+    die "fdisk is required."
 
-        sync
+command -v mkfs.ext4 >/dev/null 2>&1 ||
+    die "mkfs.ext4 is required."
 
-        case "$DISK" in
-            /dev/nvme*|/dev/mmcblk*)
-                ESP="${DISK}p1"
-                ROOT="${DISK}p2"
-                ;;
-            *)
-                ESP="${DISK}1"
-                ROOT="${DISK}2"
-                ;;
-        esac
+# --------------------------------------------------
+# UEFI → GPT
+# --------------------------------------------------
 
-        info "Waiting for kernel to detect partitions..."
+if [ "$BOOTMODE" = "UEFI" ]; then
 
-        if command -v partprobe >/dev/null 2>&1; then
-            partprobe "$DISK" || true
-        fi
+    info "Creating GPT partition table..."
 
-        sleep 2
+    sgdisk --zap-all "$DISK"
 
-        info "Formatting EFI partition..."
+    sgdisk \
+        -n 1:0:+512M \
+        -t 1:ef00 \
+        -c 1:"EFI System Partition" \
+        "$DISK"
+
+    sgdisk \
+        -n 2:0:0 \
+        -t 2:8300 \
+        -c 2:"Chimera Linux root" \
+        "$DISK"
+
+    sync
+
+    case "$DISK" in
+        /dev/nvme*|/dev/mmcblk*)
+            ESP="${DISK}p1"
+            ROOT="${DISK}p2"
+            ;;
+        *)
+            ESP="${DISK}1"
+            ROOT="${DISK}2"
+            ;;
+    esac
+
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "$DISK" || true
+    fi
+
+    sleep 2
+
+    [ -b "$ESP" ] ||
+        die "EFI partition was not created: $ESP"
+
+    [ -b "$ROOT" ] ||
+        die "Root partition was not created: $ROOT"
+
+    info "Formatting EFI partition..."
+
+    if command -v mkfs.vfat >/dev/null 2>&1; then
         mkfs.vfat -F32 "$ESP"
+    elif command -v mkfs.fat >/dev/null 2>&1; then
+        mkfs.fat -F32 "$ESP"
+    else
+        die "mkfs.vfat/mkfs.fat is required."
+    fi
 
-        info "Formatting root partition..."
-        mkfs.ext4 -F "$ROOT"
+    info "Formatting root partition..."
 
-        success "Disk prepared."
-        ;;
+    mkfs.ext4 -F "$ROOT"
 
-    2)
-        echo
-        echo "Existing partitions:"
-        echo
+    success "GPT + EFI partitioning complete."
 
-        lsblk -f
+# --------------------------------------------------
+# BIOS → MBR
+# --------------------------------------------------
 
-        echo
+else
 
-        ESP=$(ask "EFI partition: ")
-        ROOT=$(ask "Root partition: ")
+    info "Creating MBR / DOS partition table..."
 
-        ESP=$(printf '%s' "$ESP" | tr -d '[:space:]')
-        ROOT=$(printf '%s' "$ROOT" | tr -d '[:space:]')
+    fdisk "$DISK" <<EOF
+o
+n
+p
+1
 
-        [ -b "$ESP" ] || die "EFI partition does not exist: $ESP"
-        [ -b "$ROOT" ] || die "Root partition does not exist: $ROOT"
 
-        success "Existing partitions selected."
-        ;;
+a
+1
+w
+EOF
 
-    *)
-        die "Invalid choice."
-        ;;
-esac
+    sync
+
+    case "$DISK" in
+        /dev/nvme*|/dev/mmcblk*)
+            ROOT="${DISK}p1"
+            ;;
+        *)
+            ROOT="${DISK}1"
+            ;;
+    esac
+
+    if command -v partprobe >/dev/null 2>&1; then
+        partprobe "$DISK" || true
+    fi
+
+    sleep 2
+
+    [ -b "$ROOT" ] ||
+        die "Root partition was not created: $ROOT"
+
+    info "Formatting root partition..."
+
+    mkfs.ext4 -F "$ROOT"
+
+    success "MBR partitioning complete."
+
+fi
 
 pause
 
-# --------------------------------------------------
+# ==================================================
 # Hostname
-# --------------------------------------------------
+# ==================================================
 
 clear
 
-echo "${BOLD}3. PC name${RESET}"
-echo
-echo "This is the hostname of your computer."
+echo "${BOLD}4. PC name${RESET}"
 echo
 
 HOSTNAME=$(ask "PC name [chimera]: ")
@@ -302,13 +379,13 @@ case "$HOSTNAME" in
         ;;
 esac
 
-# --------------------------------------------------
+# ==================================================
 # User
-# --------------------------------------------------
+# ==================================================
 
 clear
 
-echo "${BOLD}4. User account${RESET}"
+echo "${BOLD}5. User account${RESET}"
 echo
 
 USERNAME=$(ask "Username [kolon]: ")
@@ -328,7 +405,8 @@ read -r USERPASS
 stty echo
 echo
 
-[ -n "$USERPASS" ] || die "User password cannot be empty."
+[ -n "$USERPASS" ] ||
+    die "User password cannot be empty."
 
 printf "Repeat user password: "
 stty -echo
@@ -339,9 +417,9 @@ echo
 [ "$USERPASS" = "$USERPASS2" ] ||
     die "User passwords do not match."
 
-# --------------------------------------------------
+# ==================================================
 # Root password
-# --------------------------------------------------
+# ==================================================
 
 echo
 
@@ -351,7 +429,8 @@ read -r ROOTPASS
 stty echo
 echo
 
-[ -n "$ROOTPASS" ] || die "Root password cannot be empty."
+[ -n "$ROOTPASS" ] ||
+    die "Root password cannot be empty."
 
 printf "Repeat root password: "
 stty -echo
@@ -362,53 +441,27 @@ echo
 [ "$ROOTPASS" = "$ROOTPASS2" ] ||
     die "Root passwords do not match."
 
-# --------------------------------------------------
+# ==================================================
 # Repository
-# --------------------------------------------------
+# ==================================================
 
 clear
 
-echo "${BOLD}5. Repository${RESET}"
-echo
-echo "Choose a Chimera Linux mirror:"
-echo
-echo "  1) Official"
-echo "     Prague"
-echo
-echo "  2) Warsaw"
-echo
-echo "  3) Umea"
-echo
-echo "  4) Brisbane"
-echo
-echo "  5) Hanoi"
-echo
-echo "  6) Custom URL"
+echo "${BOLD}6. Repository${RESET}"
 echo
 
-REPOCHOICE=$(ask "Choice [1-6]: ")
-REPOCHOICE=$(printf '%s' "$REPOCHOICE" | tr -d '[:space:]')
+echo "  1) Official Chimera repository"
+echo "  2) Custom repository URL"
+echo
 
-case "$REPOCHOICE" in
+REPO=$(ask "Choice [1-2]: ")
+
+case "$REPO" in
     1)
         MIRROR="https://repo.chimera-linux.org"
         ;;
     2)
-        MIRROR="https://chimera.sakamoto.pl"
-        ;;
-    3)
-        MIRROR="https://mirror.accum.se/mirror/chimera-linux.org"
-        ;;
-    4)
-        MIRROR="https://au.mirror.7bit.org/chimera"
-        ;;
-    5)
-        MIRROR="https://mirror.meowsmp.net/chimera-linux"
-        ;;
-    6)
         MIRROR=$(ask "Repository URL: ")
-        MIRROR=$(printf '%s' "$MIRROR" | tr -d '[:space:]')
-
         [ -n "$MIRROR" ] ||
             die "Repository URL cannot be empty."
         ;;
@@ -417,13 +470,13 @@ case "$REPOCHOICE" in
         ;;
 esac
 
-# --------------------------------------------------
+# ==================================================
 # Kernel
-# --------------------------------------------------
+# ==================================================
 
 clear
 
-echo "${BOLD}6. Kernel${RESET}"
+echo "${BOLD}7. Kernel${RESET}"
 echo
 
 echo "  1) linux-lts"
@@ -434,7 +487,6 @@ echo "     Current stable kernel"
 echo
 
 KERNELCHOICE=$(ask "Choice [1-2]: ")
-KERNELCHOICE=$(printf '%s' "$KERNELCHOICE" | tr -d '[:space:]')
 
 case "$KERNELCHOICE" in
     1)
@@ -448,47 +500,9 @@ case "$KERNELCHOICE" in
         ;;
 esac
 
-# --------------------------------------------------
-# Bootloader
-# --------------------------------------------------
-
-clear
-
-echo "${BOLD}7. Bootloader${RESET}"
-echo
-
-if [ -d /sys/firmware/efi ]; then
-    BOOTMODE="UEFI"
-    echo "Detected boot mode: UEFI"
-else
-    BOOTMODE="BIOS"
-    echo "Detected boot mode: BIOS/Legacy"
-fi
-
-echo
-
-echo "  1) GRUB"
-echo "  2) systemd-boot"
-echo
-
-BOOT=$(ask "Choice [1-2]: ")
-BOOT=$(printf '%s' "$BOOT" | tr -d '[:space:]')
-
-if [ "$BOOTMODE" = "BIOS" ] && [ "$BOOT" = "2" ]; then
-    die "systemd-boot requires UEFI."
-fi
-
-case "$BOOT" in
-    1|2)
-        ;;
-    *)
-        die "Invalid bootloader choice."
-        ;;
-esac
-
-# --------------------------------------------------
+# ==================================================
 # Desktop
-# --------------------------------------------------
+# ==================================================
 
 clear
 
@@ -503,7 +517,6 @@ echo "  5) Sway"
 echo
 
 DESKTOP=$(ask "Choice [1-5]: ")
-DESKTOP=$(printf '%s' "$DESKTOP" | tr -d '[:space:]')
 
 case "$DESKTOP" in
     1)
@@ -526,9 +539,9 @@ case "$DESKTOP" in
         ;;
 esac
 
-# --------------------------------------------------
+# ==================================================
 # Summary
-# --------------------------------------------------
+# ==================================================
 
 clear
 
@@ -539,20 +552,23 @@ echo "╚═══════════════════════�
 echo "${RESET}"
 
 echo
-echo "Disk:        $DISK"
-echo "EFI:         $ESP"
+echo "Boot mode:   $BOOTMODE"
+
+if [ "$BOOTMODE" = "UEFI" ]; then
+    echo "Partition:   GPT"
+    echo "EFI:         $ESP"
+else
+    echo "Partition:   MBR / DOS"
+fi
+
 echo "Root:        $ROOT"
 echo
+echo "Disk:        $DISK"
 echo "PC name:     $HOSTNAME"
 echo "Username:    $USERNAME"
 echo "Repository:  $MIRROR"
 echo "Kernel:      $KERNEL"
-
-if [ "$BOOT" = "1" ]; then
-    echo "Bootloader:  GRUB"
-else
-    echo "Bootloader:  systemd-boot"
-fi
+echo "Bootloader:  GRUB"
 
 if [ -n "$DESKTOP_PACKAGE" ]; then
     echo "Desktop:     $DESKTOP_PACKAGE"
@@ -564,7 +580,7 @@ echo
 echo "Passwords:   configured"
 echo
 
-warning "The installation will now modify the selected disk."
+warning "The selected disk will be erased."
 echo
 
 if ! yesno "Start installation?"; then
@@ -572,41 +588,39 @@ if ! yesno "Start installation?"; then
     exit 0
 fi
 
-# --------------------------------------------------
+# ==================================================
 # Mount
-# --------------------------------------------------
+# ==================================================
 
 clear
 
 info "Mounting root filesystem..."
 
 mkdir -p /media/root
-
 mount "$ROOT" /media/root
 
-mkdir -p /media/root/boot/efi
-
 if [ "$BOOTMODE" = "UEFI" ]; then
+    mkdir -p /media/root/boot/efi
     mount "$ESP" /media/root/boot/efi
 fi
 
 success "Filesystem mounted."
 
-# --------------------------------------------------
+# ==================================================
 # Bootstrap
-# --------------------------------------------------
+# ==================================================
 
 info "Bootstrapping Chimera Linux..."
 
 chimera-bootstrap -l /media/root
 
-success "Base system installed."
+success "Base Chimera system installed."
 
-# --------------------------------------------------
+# ==================================================
 # Repository
-# --------------------------------------------------
+# ==================================================
 
-info "Configuring repository mirror..."
+info "Configuring repository..."
 
 mkdir -p /media/root/etc/apk/repositories.d
 
@@ -616,9 +630,9 @@ EOF
 
 success "Repository configured."
 
-# --------------------------------------------------
-# Basic packages
-# --------------------------------------------------
+# ==================================================
+# Base packages
+# ==================================================
 
 info "Updating package database..."
 
@@ -629,7 +643,7 @@ apk update
 apk upgrade --available
 EOF
 
-info "Installing basic packages..."
+info "Installing kernel and basic tools..."
 
 chimera-chroot /media/root /bin/sh <<EOF
 set -e
@@ -647,19 +661,19 @@ EOF
 
 success "Basic packages installed."
 
-# --------------------------------------------------
-# Remove live-only package
-# --------------------------------------------------
+# ==================================================
+# Remove Live components
+# ==================================================
 
-info "Removing live-only components..."
+info "Removing Live-only components..."
 
 chimera-chroot /media/root /bin/sh <<EOF
 apk del base-live || true
 EOF
 
-# --------------------------------------------------
+# ==================================================
 # Desktop
-# --------------------------------------------------
+# ==================================================
 
 if [ -n "$DESKTOP_PACKAGE" ]; then
 
@@ -671,11 +685,12 @@ apk add $DESKTOP_PACKAGE
 EOF
 
     success "Desktop installed."
+
 fi
 
-# --------------------------------------------------
+# ==================================================
 # User
-# --------------------------------------------------
+# ==================================================
 
 info "Creating user account..."
 
@@ -692,14 +707,13 @@ echo "$USERNAME:$USERPASS" | chpasswd
 addgroup "$USERNAME" wheel
 addgroup "$USERNAME" video
 addgroup "$USERNAME" audio
-
 EOF
 
 success "User account configured."
 
-# --------------------------------------------------
+# ==================================================
 # Initramfs
-# --------------------------------------------------
+# ==================================================
 
 info "Generating initramfs..."
 
@@ -710,17 +724,15 @@ EOF
 
 success "Initramfs generated."
 
-# --------------------------------------------------
-# Bootloader
-# --------------------------------------------------
+# ==================================================
+# GRUB
+# ==================================================
 
-if [ "$BOOT" = "1" ]; then
+info "Installing GRUB..."
 
-    info "Installing GRUB..."
+if [ "$BOOTMODE" = "UEFI" ]; then
 
-    if [ "$BOOTMODE" = "UEFI" ]; then
-
-        chimera-chroot /media/root /bin/sh <<EOF
+    chimera-chroot /media/root /bin/sh <<EOF
 set -e
 
 apk add grub-x86_64-efi
@@ -733,56 +745,33 @@ grub-install \
 update-grub
 EOF
 
-    else
-
-        chimera-chroot /media/root /bin/sh <<EOF
-set -e
-
-apk add grub-i386-pc
-
-grub-install "$DISK"
-
-update-grub
-EOF
-
-    fi
-
-    success "GRUB installed."
-
-elif [ "$BOOT" = "2" ]; then
-
-    info "Installing systemd-boot..."
+else
 
     chimera-chroot /media/root /bin/sh <<EOF
 set -e
 
-apk add systemd-boot
-bootctl install
-EOF
+apk add grub-i386-pc
 
-    success "systemd-boot installed."
+grub-install \
+    --target=i386-pc \
+    "$DISK"
+
+update-grub
+EOF
 
 fi
 
-# --------------------------------------------------
-# Sync
-# --------------------------------------------------
+success "GRUB installed."
+
+# ==================================================
+# Finish
+# ==================================================
 
 info "Writing changes to disk..."
-
 sync
 
-# --------------------------------------------------
-# Unmount
-# --------------------------------------------------
-
 info "Unmounting filesystem..."
-
 umount -R /media/root 2>/dev/null || true
-
-# --------------------------------------------------
-# Finish
-# --------------------------------------------------
 
 clear
 
@@ -795,9 +784,12 @@ echo "${RESET}"
 echo
 echo "Chimera Linux has been installed."
 echo
-echo "PC name:  $HOSTNAME"
-echo "User:     $USERNAME"
-echo "Kernel:   $KERNEL"
+echo "Boot mode:  $BOOTMODE"
+echo "Disk:       $DISK"
+echo "Root:       $ROOT"
+echo "PC name:    $HOSTNAME"
+echo "User:       $USERNAME"
+echo "Kernel:     $KERNEL"
 echo
 
 warning "Remove the installation USB before rebooting."

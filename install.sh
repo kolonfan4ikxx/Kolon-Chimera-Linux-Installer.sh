@@ -216,6 +216,16 @@ is_mounted() {
     awk -v p="$1" '$1 == p { f = 1 } END { exit !f }' /proc/mounts
 }
 
+# Portable replacement for "sed -i" (Chimera uses BSD sed, where -i needs
+# a suffix argument and behaves differently from GNU sed).
+# Usage: sed_inplace 'script' file
+sed_inplace() {
+    _sed_tmp="$2.kolon-tmp"
+    sed "$1" "$2" > "$_sed_tmp" || { rm -f "$_sed_tmp"; return 1; }
+    cat "$_sed_tmp" > "$2"
+    rm -f "$_sed_tmp"
+}
+
 # Run a shell script (from stdin) inside the new system
 in_chroot() {
     chimera-chroot "$MNT" /bin/sh -e
@@ -820,7 +830,7 @@ if [ "$MIRROR" != "$OFFICIAL_REPO" ]; then
 
     for f in "$MNT"/etc/apk/repositories.d/*.list; do
         [ -f "$f" ] || continue
-        sed -i "s|$OFFICIAL_REPO|$MIRROR_ESC|g" "$f"
+        sed_inplace "s|$OFFICIAL_REPO|$MIRROR_ESC|g" "$f"
     done
 
     success "Mirror configured."
@@ -995,7 +1005,7 @@ if [ "$SWAP_MODE" = "HIBERNATE" ]; then
     mkdir -p "$MNT/etc/default"
 
     if [ -f "$GRUBCFG" ] && grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUBCFG"; then
-        sed -i "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 resume=UUID=$SWAP_UUID\"|" "$GRUBCFG"
+        sed_inplace "s|^\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"|\1 resume=UUID=$SWAP_UUID\"|" "$GRUBCFG"
     else
         printf 'GRUB_CMDLINE_LINUX_DEFAULT="resume=UUID=%s"\n' "$SWAP_UUID" >> "$GRUBCFG"
     fi
